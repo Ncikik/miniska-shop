@@ -1,86 +1,73 @@
-import 'dart:convert';
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import '../data/mock_products.dart';
 import '../models/product.dart';
 
-/// จัดการสินค้า: รวมสินค้าตั้งต้น (mockProducts) กับสินค้าที่เจ้าของร้าน/พนักงานเพิ่มเอง
-/// บันทึกลง SharedPreferences เพื่อให้ข้อมูลอยู่ถาวรในเบราว์เซอร์/เครื่องนั้น ๆ
+/// จัดการสินค้า: ดึง/เพิ่ม/แก้ไข/ลบ ข้อมูลจาก Cloud Firestore (collection "products")
+/// โดยตรง แทนที่การใช้ mock_products + SharedPreferences แบบเดิม
 class ProductProvider extends ChangeNotifier {
+  final CollectionReference<Map<String, dynamic>> _productsRef =
+      FirebaseFirestore.instance.collection('products');
+
   bool _loaded = false;
   bool get isLoaded => _loaded;
-  static const _customKey = 'app_custom_products_v1';
-  static const _hiddenKey = 'app_hidden_product_ids_v1';
 
-  final List<Product> _customProducts = [];
-  final Set<String> _hiddenIds = {};
+  List<Product> _products = [];
+  List<Product> get products => _products;
 
-  List<Product> get products => [
-        ...mockProducts.where((p) => !_hiddenIds.contains(p.id)),
-        ..._customProducts,
-      ];
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _subscription;
 
+  /// เริ่มฟังข้อมูลจาก Firestore แบบ real-time
+  /// เรียกครั้งเดียวตอนแอพเริ่มทำงาน (เช่นใน main.dart หรือตอนสร้าง provider)
   Future<void> init() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_customKey);
-    if (raw != null) {
-      try {
-        final list = jsonDecode(raw) as List;
-        _customProducts
-          ..clear()
-          ..addAll(
-            list.map((e) => Product.fromJson(e as Map<String, dynamic>)),
-          );
-      } catch (_) {
-        _customProducts.clear();
-      }
-    }
-    final hidden = prefs.getStringList(_hiddenKey);
-    if (hidden != null) {
-      _hiddenIds
-        ..clear()
-        ..addAll(hidden);
-    }
-    notifyListeners();
-    _loaded = true;
-  }
+    // ยกเลิกการฟังเดิมถ้ามี (กันการเรียกซ้ำ)
+    await _subscription?.cancel();
 
-  Future<void> _persist(SharedPreferences prefs) async {
-    await prefs.setString(
-      _customKey,
-      jsonEncode(_customProducts.map((p) => p.toJson()).toList()),
+    _subscription = _productsRef.snapshots().listen(
+      (snapshot) {
+        _products = snapshot.docs.map((doc) {
+          final data = doc.data();
+          // กันเคสข้อมูลเก่าที่ไม่มี field 'id' เก็บไว้ในตัวเอกสาร
+          data['id'] = doc.id;
+          return Product.fromJson(data);
+        }).toList();
+
+        _loaded = true;
+        notifyListeners();
+      },
+      onError: (error) {
+        debugPrint('ProductProvider: error listening to products: $error');
+        _loaded = true;
+        notifyListeners();
+      },
     );
-    await prefs.setStringList(_hiddenKey, _hiddenIds.toList());
+
+    // รอให้ได้ข้อมูลชุดแรกก่อน (กัน UI โชว์ค่าว่างตอนเปิดแอพครั้งแรก)
+    await _productsRef.get();
   }
 
-  String nextId() => 'c_${DateTime.now().millisecondsSinceEpoch}';
+  String nextId() => _productsRef.doc().id;
 
   Future<void> addProduct(Product product) async {
-    _customProducts.add(product);
-    notifyListeners();
-    final prefs = await SharedPreferences.getInstance();
-    await _persist(prefs);
+    await _productsRef.doc(product.id).set(product.toJson());
+    // ไม่ต้อง notifyListeners() เอง เพราะ stream listener ด้านบนจะอัปเดตให้อัตโนมัติ
   }
 
   Future<void> updateProduct(Product product) async {
-    final idx = _customProducts.indexWhere((p) => p.id == product.id);
-    if (idx != -1) {
-      _customProducts[idx] = product;
-    } else {
-      // เป็นสินค้าตั้งต้น: ซ่อนของเดิม แล้วเก็บฉบับแก้ไขเป็นสินค้าที่กำหนดเองแทน
-      _hiddenIds.add(product.id);
-      _customProducts.add(product);
-    }
-    notifyListeners();
-    final prefs = await SharedPreferences.getInstance();
-    await _persist(prefs);
+    await _productsRef.doc(product.id).set(
+          product.toJson(),
+          SetOptions(merge: true),
+        );
   }
 
   Future<void> deleteProduct(String id) async {
-    _customProducts.removeWhere((p) => p.id == id);
-    _hiddenIds.add(id);
-    notifyListeners();
-    final prefs = await SharedPreferences.getInstance();
-    await _persist(prefs);
+    await _productsRef.doc(id).delete();
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
   }
 }
